@@ -183,16 +183,27 @@ void getGNSSInfo() {
   String response = "";
   modem.sendAT("+CGNSSINFO");
   if (modem.waitResponse(10000L, response) == 1) {
+    // Check if the response contains real data
+    if (response.indexOf("+CGNSSINFO: ,,,,,,,,,,,,,,,") != -1) {
+      SerialMon.println("No GNSS fix or empty data");
+      return;
+    }
+
     int colonIndex = response.indexOf(':');
     if (colonIndex != -1) {
       response = response.substring(colonIndex + 1);
-      sscanf(response.c_str(), "%*d,%d,%d,%d", &gps_sats, &glonass_sats, &beidou_sats);
-      SerialMon.print("GNSS info: GPS=");
-      SerialMon.print(gps_sats);
-      SerialMon.print(" GLONASS=");
-      SerialMon.print(glonass_sats);
-      SerialMon.print(" BeiDou=");
-      SerialMon.println(beidou_sats);
+      response.trim();  // Remove leading/trailing whitespace
+      
+      if (sscanf(response.c_str(), "%*d,%d,%d,%d", &gps_sats, &glonass_sats, &beidou_sats) == 3) {
+        SerialMon.print("GNSS info: GPS=");
+        SerialMon.print(gps_sats);
+        SerialMon.print(" GLONASS=");
+        SerialMon.print(glonass_sats);
+        SerialMon.print(" BeiDou=");
+        SerialMon.println(beidou_sats);
+      } else {
+        SerialMon.println("GNSS info parsing error");
+      }
     } else {
       SerialMon.println("GNSS info format error");
     }
@@ -227,7 +238,7 @@ void sendAPRSPacket(float lat, float lon, float speed, float alt, float course, 
   float battVoltage = getBatteryVoltage();
   char batteryStatus[16];  // Buffer for battery status string
   if (battVoltage < 0.01) {
-    snprintf(batteryStatus, sizeof(batteryStatus), "CHARGING");
+    snprintf(batteryStatus, sizeof(batteryStatus), "PLUGGED IN");
   } else {
     snprintf(batteryStatus, sizeof(batteryStatus), "%.2fV", battVoltage);
   }
@@ -380,50 +391,54 @@ void loop() {
 
   if (modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &accuracy,
                    &year, &month, &day, &hour, &min, &sec)) {
-    digitalWrite(LED_PIN, HIGH);
+    if (lat != 0 && lon != 0) {
+      digitalWrite(LED_PIN, HIGH);
 
-    float course = 0;
-    if (lastLat != 0 || lastLon != 0)
-      course = computeBearing(lastLat, lastLon, lat, lon);
+      float course = 0;
+      if (lastLat != 0 || lastLon != 0)
+        course = computeBearing(lastLat, lastLon, lat, lon);
 
-    getGNSSInfo();
+      getGNSSInfo();
 
-    unsigned long currentTime = millis();
-    float distanceTraveled = haversine(lastLat, lastLon, lat, lon);
-    float courseChange = fabs(course - lastCourse);
-    unsigned long dynamicInterval = getDynamicInterval(speed);
-    bool timeTrigger = (currentTime - lastTransmitTime >= dynamicInterval);
-    bool distanceTrigger = (distanceTraveled >= DISTANCE_THRESHOLD);
-    bool turnTrigger = (courseChange >= TURN_THRESHOLD);
-    bool isStationary = (speed < 1.0);
+      unsigned long currentTime = millis();
+      float distanceTraveled = haversine(lastLat, lastLon, lat, lon);
+      float courseChange = fabs(course - lastCourse);
+      unsigned long dynamicInterval = getDynamicInterval(speed);
+      bool timeTrigger = (currentTime - lastTransmitTime >= dynamicInterval);
+      bool distanceTrigger = (distanceTraveled >= DISTANCE_THRESHOLD);
+      bool turnTrigger = (courseChange >= TURN_THRESHOLD);
+      bool isStationary = (speed < 1.0);
 
-    if ((timeTrigger && !isStationary) || distanceTrigger || turnTrigger) {
-      int totalSats = gps_sats + glonass_sats + beidou_sats;
-      sendAPRSPacket(lat, lon, speed, alt, course, totalSats);
-      lastTransmitTime = currentTime;
-      lastLat = lat;
-      lastLon = lon;
-      if (turnTrigger)
-        lastCourse = course;
-    } else if (isStationary && (currentTime - lastTransmitTime >= MAX_INTERVAL)) {
-      int totalSats = gps_sats + glonass_sats + beidou_sats;
-      sendAPRSPacket(lat, lon, speed, alt, course, totalSats);
-      lastTransmitTime = currentTime;
-    }
+      if ((timeTrigger && !isStationary) || distanceTrigger || turnTrigger) {
+        int totalSats = gps_sats + glonass_sats + beidou_sats;
+        sendAPRSPacket(lat, lon, speed, alt, course, totalSats);
+        lastTransmitTime = currentTime;
+        lastLat = lat;
+        lastLon = lon;
+        if (turnTrigger)
+          lastCourse = course;
+      } else if (isStationary && (currentTime - lastTransmitTime >= MAX_INTERVAL)) {
+        int totalSats = gps_sats + glonass_sats + beidou_sats;
+        sendAPRSPacket(lat, lon, speed, alt, course, totalSats);
+        lastTransmitTime = currentTime;
+      }
 
-    if (batteryVoltage < 0.01) {
-      SerialMon.println("Battery voltage: CHARGING");
+      if (batteryVoltage < 0.01) {
+        SerialMon.println("Battery voltage: PLUGGED IN");
+      } else {
+        SerialMon.print("Battery voltage: ");
+        SerialMon.print(batteryVoltage, 2);
+        SerialMon.println(" V");
+      }
     } else {
-      SerialMon.print("Battery voltage: ");
-      SerialMon.print(batteryVoltage, 2);
-      SerialMon.println(" V");
+      SerialMon.println("Invalid GPS position (0,0). Skipping.");
     }
   } else {
     blinkLED();
     SerialMon.println("Failed to get GPS fix");
 
     if (batteryVoltage < 0.01) {
-      SerialMon.println("Battery voltage: CHARGING");
+      SerialMon.println("Battery voltage: PLUGGED IN");
     } else {
       SerialMon.print("Battery voltage: ");
       SerialMon.print(batteryVoltage, 2);
