@@ -21,7 +21,7 @@ const char apn[] = "internet";
 const char gprsUser[] = "";
 const char gprsPass[] = "";
 const char* aprsServer = "euro.aprs2.net";
-const int   aprsPort = 14580;
+const int aprsPort = 14580;
 const char* aprsCallsign = "SQ4LOL-19";    // Replace with your callsign
 const char* aprsPasscode = "23475";         // Replace with your APRS passcode
 
@@ -51,11 +51,11 @@ const char* aprsPasscode = "23475";         // Replace with your APRS passcode
 #define LED_PIN          12
 
 #ifdef DUMP_AT_COMMANDS
-  #include <StreamDebugger.h>
-  StreamDebugger debugger(SerialAT, SerialMon);
-  TinyGsm modem(debugger);
+#include <StreamDebugger.h>
+StreamDebugger debugger(SerialAT, SerialMon);
+TinyGsm modem(debugger);
 #else
-  TinyGsm modem(SerialAT);
+TinyGsm modem(SerialAT);
 #endif
 
 // APRS communication client using the modem
@@ -102,6 +102,27 @@ bool ledState = false;
 #define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds
 #define TIME_TO_SLEEP  3600        // Time ESP32 will go to sleep (in seconds) - 1 hour
 #define BATTERY_THRESHOLD 3.2      // Voltage threshold for low battery
+
+//-------------------------------------------------------------------
+// Function Declarations
+//-------------------------------------------------------------------
+float getBatteryVoltage();
+void enableAGPS();
+float computeBearing(float lat1, float lon1, float lat2, float lon2);
+float haversine(float lat1, float lon1, float lat2, float lon2);
+unsigned long getDynamicInterval(float speed);
+void getGNSSInfo();
+void sendAPRSPacket(float lat, float lon, float speed, float alt, float course, int totalSats);
+void blinkLED();
+void enterDeepSleep();
+void initializeSerial();
+void powerOnModem();
+void initializeModem();
+void connectToNetwork();
+void enableGNSS();
+void checkWakeupReason();
+void setup();
+void loop();
 
 //-------------------------------------------------------------------
 // Function: getBatteryVoltage()
@@ -193,7 +214,7 @@ void getGNSSInfo() {
     if (colonIndex != -1) {
       response = response.substring(colonIndex + 1);
       response.trim();  // Remove leading/trailing whitespace
-      
+
       if (sscanf(response.c_str(), "%*d,%d,%d,%d", &gps_sats, &glonass_sats, &beidou_sats) == 3) {
         SerialMon.print("GNSS info: GPS=");
         SerialMon.print(gps_sats);
@@ -299,36 +320,48 @@ void enterDeepSleep() {
 }
 
 //-------------------------------------------------------------------
-// Function: setup()
-// Initializes serial communication, powers up the modem, waits for network,
-// connects to the APN, requests AGPS data, and enables GNSS.
+// Function: initializeSerial()
+// Initializes the serial communication.
 //-------------------------------------------------------------------
-void setup() {
+void initializeSerial() {
   SerialMon.begin(115200);
   SerialAT.begin(UART_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
-
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
+}
 
+//-------------------------------------------------------------------
+// Function: powerOnModem()
+// Powers on the modem by toggling the power key.
+//-------------------------------------------------------------------
+void powerOnModem() {
   pinMode(MODEM_PWRKEY, OUTPUT);
   digitalWrite(MODEM_PWRKEY, HIGH);
   delay(300);
   digitalWrite(MODEM_PWRKEY, LOW);
-
   pinMode(MODEM_FLIGHT, OUTPUT);
   digitalWrite(MODEM_FLIGHT, HIGH);
+}
 
+//-------------------------------------------------------------------
+// Function: initializeModem()
+// Initializes the modem and waits for response to AT commands.
+//-------------------------------------------------------------------
+void initializeModem() {
   SerialMon.println("Starting modem...");
   delay(3000);
-
-  // Wait for modem to respond to AT commands
   while (!modem.testAT()) {
     delay(10);
   }
-
   bool ret = modem.setNetworkMode(2);
   DBG("setNetworkMode:", ret);
+}
 
+//-------------------------------------------------------------------
+// Function: connectToNetwork()
+// Connects to the network and APN.
+//-------------------------------------------------------------------
+void connectToNetwork() {
   SerialMon.print("Waiting for network...");
   if (!modem.waitForNetwork()) {
     SerialMon.println(" fail");
@@ -336,11 +369,9 @@ void setup() {
     return;
   }
   SerialMon.println(" success");
-
   if (modem.isNetworkConnected()) {
     SerialMon.println("Network connected");
   }
-
   SerialMon.print("Connecting to APN: ");
   SerialMon.print(apn);
   if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
@@ -349,16 +380,26 @@ void setup() {
     return;
   }
   SerialMon.println(" success");
-
   enableAGPS();
+}
 
+//-------------------------------------------------------------------
+// Function: enableGNSS()
+// Enables GNSS and waits for initialization.
+//-------------------------------------------------------------------
+void enableGNSS() {
   modem.setGNSSMode(1, 1);
   delay(1000);
   DBG("Enabling GPS/GNSS/GLONASS", true);
   modem.enableGPS();
   delay(2000);
+}
 
-  // Check if woken up from deep sleep
+//-------------------------------------------------------------------
+// Function: checkWakeupReason()
+// Checks the reason for waking up from deep sleep and logs it.
+//-------------------------------------------------------------------
+void checkWakeupReason() {
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
     SerialMon.println("Woken up from deep sleep");
@@ -366,10 +407,25 @@ void setup() {
 }
 
 //-------------------------------------------------------------------
+// Function: setup()
+// Initializes serial communication, powers up the modem, waits for network,
+// connects to the APN, requests AGPS data, and enables GNSS.
+//-------------------------------------------------------------------
+void setup() {
+  initializeSerial();
+  powerOnModem();
+  initializeModem();
+  connectToNetwork();
+  enableGNSS();
+  checkWakeupReason();
+}
+
+//-------------------------------------------------------------------
 // Function: loop()
 // Attempts to get a GPS fix. When a fix is acquired, it processes beacon conditions,
 // sends APRS packets (with updated battery/satellite data) and prints battery voltage.
-// If no GPS fix is available, the LED blinks an
+// If no GPS fix is available, the LED blinks and it retries after a delay.
+//-------------------------------------------------------------------
 void loop() {
   float lat = 0, lon = 0, speed = 0, alt = 0;
   int vsat = 0, usat = 0;
