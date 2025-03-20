@@ -64,14 +64,16 @@ TinyGsmClient client(modem);
 //-------------------------------------------------------------------
 // SmartBeaconing Parameters (for APRS)
 //-------------------------------------------------------------------
-const unsigned long MIN_INTERVAL = 60000;  // Fast beacon (e.g., when moving fast, 1 minute)
-const unsigned long MAX_INTERVAL = 300000;  // Slow beacon (e.g., when moving slow, 300 seconds)
-const float TURN_THRESHOLD = 30.0;         // Degrees change that triggers beaconing
-const float DISTANCE_THRESHOLD = 0.5;      // km traveled for triggering beacon
-const float SPEED_THRESHOLD = 5.0;        // km/h below which slow interval is used
-const float MAX_BEACON_SPEED = 70.0;         // Maximum speed cap for dynamic interval
+const unsigned long FAST_RATE = 60000;     // 60-second minimum interval
+const unsigned long SLOW_RATE = 300000;    // 300-second maximum interval
+const float FAST_SPEED = 90.0;            // km/h above which rate caps
+const float SLOW_SPEED = 5.0;             // km/h below which rate increases
+const float MIN_TURN_ANGLE = 28.0;        // Base turn threshold (°)
+const float TURN_SLOPE = 26.0;           // Dynamic angle adjustment (angle*speed)
+const float MIN_TURN_TIME = 30.0;         // Minimum time between turn beacons (sec)
 
 unsigned long lastTransmitTime = 0;
+unsigned long lastTurnTime = 0;
 float lastLat = 0;
 float lastLon = 0;
 float lastCourse = 0;
@@ -110,10 +112,13 @@ float getBatteryVoltage();
 void enableAGPS();
 float computeBearing(float lat1, float lon1, float lat2, float lon2);
 float haversine(float lat1, float lon1, float lat2, float lon2);
+float calculateEffectiveTurnThreshold(float speed);
 unsigned long getDynamicInterval(float speed);
+bool processBeaconConditions(float lat, float lon, float speed, float course);
 void getGNSSInfo();
 void sendAPRSPacket(float lat, float lon, float speed, float alt, float course, int totalSats);
 void blinkLED();
+void blinkTwiceFast();
 void enterDeepSleep();
 void initializeSerial();
 void powerOnModem();
@@ -181,19 +186,58 @@ float haversine(float lat1, float lon1, float lat2, float lon2) {
 }
 
 //-------------------------------------------------------------------
+// Function: calculateEffectiveTurnThreshold()
+// Computes dynamic turn threshold based on current speed
+//-------------------------------------------------------------------
+float calculateEffectiveTurnThreshold(float speed) {
+  if (speed <= 0) return MIN_TURN_ANGLE;  // Prevent division by zero
+  return MIN_TURN_ANGLE + (TURN_SLOPE / speed);
+}
+
+//-------------------------------------------------------------------
 // Function: getDynamicInterval()
-// Returns a dynamic interval (in ms) for beaconing based on the current speed.
+// Returns beacon interval based on speed using SmartBeaconing logic
 //-------------------------------------------------------------------
 unsigned long getDynamicInterval(float speed) {
-  if (speed < SPEED_THRESHOLD)
-    return MAX_INTERVAL;
-  if (speed > MAX_BEACON_SPEED)
-    speed = MAX_BEACON_SPEED;
-  unsigned long interval = MAX_INTERVAL - (unsigned long)(
-      ((speed - SPEED_THRESHOLD) / (MAX_BEACON_SPEED - SPEED_THRESHOLD)) * (MAX_INTERVAL - MIN_INTERVAL));
-  if (interval < MIN_INTERVAL)
-    interval = MIN_INTERVAL;
-  return interval;
+  if (speed <= SLOW_SPEED) {
+    return SLOW_RATE;
+  }
+  
+  if (speed >= FAST_SPEED) {
+    return FAST_RATE;
+  }
+  
+  // Linear interpolation between SLOW_RATE and FAST_RATE
+  float speedRange = FAST_SPEED - SLOW_SPEED;
+  float rateRange = SLOW_RATE - FAST_RATE;
+  float normalizedSpeed = (speed - SLOW_SPEED) / speedRange;
+  return SLOW_RATE - (unsigned long)(normalizedSpeed * rateRange);
+}
+
+//-------------------------------------------------------------------
+// Function: processBeaconConditions()
+// Returns true if beacon should be sent based on SmartBeaconing rules
+//-------------------------------------------------------------------
+bool processBeaconConditions(float lat, float lon, float speed, float course) {
+  unsigned long currentTime = millis();
+  float courseChange = fabs(course - lastCourse);
+  float effectiveTurnThreshold = calculateEffectiveTurnThreshold(speed);
+  unsigned long dynamicInterval = getDynamicInterval(speed);
+  
+  // If course change exceeds 180 degrees, calculate the smaller angle
+  if (courseChange > 180) {
+    courseChange = 360 - courseChange;
+  }
+  
+  bool timeTrigger = (currentTime - lastTransmitTime >= dynamicInterval);
+  bool turnTrigger = (courseChange >= effectiveTurnThreshold) && 
+                     (currentTime - lastTurnTime >= (unsigned long)(MIN_TURN_TIME * 1000));
+  
+  if (turnTrigger) {
+    lastTurnTime = currentTime;  // Reset turn timer
+  }
+  
+  return timeTrigger || turnTrigger;
 }
 
 //-------------------------------------------------------------------
@@ -277,6 +321,7 @@ void sendAPRSPacket(float lat, float lon, float speed, float alt, float course, 
   }
   SerialMon.println(" success");
 
+  blinkTwiceFast();
   client.print("user ");
   client.print(aprsCallsign);
   client.print(" pass ");
@@ -305,6 +350,28 @@ void blinkLED() {
     digitalWrite(LED_PIN, ledState ? HIGH : LOW);
     lastBlinkTime = currentMillis;
   }
+}
+
+//-------------------------------------------------------------------
+// Function: blinkTwiceFast()
+// Blinks the LED twice quickly to indicate APRS packet transmission
+//-------------------------------------------------------------------
+void blinkTwiceFast() {
+  // Store current LED state
+  bool currentLedState = digitalRead(LED_PIN);
+  
+  // Blink twice fast
+  digitalWrite(LED_PIN, HIGH);
+  delay(100);
+  digitalWrite(LED_PIN, LOW);
+  delay(100);
+  digitalWrite(LED_PIN, HIGH);
+  delay(100);
+  digitalWrite(LED_PIN, LOW);
+  delay(100);
+  
+  // Restore previous LED state
+  digitalWrite(LED_PIN, currentLedState);
 }
 
 //-------------------------------------------------------------------
@@ -423,7 +490,7 @@ void setup() {
 //-------------------------------------------------------------------
 // Function: loop()
 // Attempts to get a GPS fix. When a fix is acquired, it processes beacon conditions,
-// sends APRS packets (with updated battery/satellite data) and prints battery voltage.
+// sends APRS packets (with updated battery/satellite data).
 // If no GPS fix is available, the LED blinks and it retries after a delay.
 //-------------------------------------------------------------------
 void loop() {
@@ -447,38 +514,41 @@ void loop() {
 
   if (modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &accuracy,
                    &year, &month, &day, &hour, &min, &sec)) {
+    
     if (lat != 0 && lon != 0) {
       digitalWrite(LED_PIN, HIGH);
-
+      
+      // Calculate course if we have previous position
       float course = 0;
-      if (lastLat != 0 || lastLon != 0)
+      if (lastLat != 0 && lastLon != 0) {
         course = computeBearing(lastLat, lastLon, lat, lon);
-
-      getGNSSInfo();
-
-      unsigned long currentTime = millis();
-      float distanceTraveled = haversine(lastLat, lastLon, lat, lon);
-      float courseChange = fabs(course - lastCourse);
-      unsigned long dynamicInterval = getDynamicInterval(speed);
-      bool timeTrigger = (currentTime - lastTransmitTime >= dynamicInterval);
-      bool distanceTrigger = (distanceTraveled >= DISTANCE_THRESHOLD);
-      bool turnTrigger = (courseChange >= TURN_THRESHOLD);
-      bool isStationary = (speed < 1.0);
-
-      if ((timeTrigger && !isStationary) || distanceTrigger || turnTrigger) {
-        int totalSats = gps_sats + glonass_sats + beidou_sats;
-        sendAPRSPacket(lat, lon, speed, alt, course, totalSats);
-        lastTransmitTime = currentTime;
-        lastLat = lat;
-        lastLon = lon;
-        if (turnTrigger)
-          lastCourse = course;
-      } else if (isStationary && (currentTime - lastTransmitTime >= MAX_INTERVAL)) {
-        int totalSats = gps_sats + glonass_sats + beidou_sats;
-        sendAPRSPacket(lat, lon, speed, alt, course, totalSats);
-        lastTransmitTime = currentTime;
       }
 
+      // Get satellite information
+      getGNSSInfo();
+      
+      // Process SmartBeaconing logic
+      bool shouldBeacon = processBeaconConditions(lat, lon, speed, course);
+      
+      // Initialize lastLat and lastLon if this is the first valid fix
+      if (lastLat == 0 && lastLon == 0) {
+        lastLat = lat;
+        lastLon = lon;
+        lastCourse = course;
+        lastTransmitTime = millis();
+        shouldBeacon = true;  // Always beacon on first fix
+      }
+      
+      if (shouldBeacon) {
+        int totalSats = gps_sats + glonass_sats + beidou_sats;
+        sendAPRSPacket(lat, lon, speed, alt, course, totalSats);
+        lastTransmitTime = millis();
+        lastLat = lat;
+        lastLon = lon;
+        lastCourse = course;
+      }
+
+      // Output battery status
       if (batteryVoltage < 0.01) {
         SerialMon.println("Battery voltage: PLUGGED IN");
       } else {
