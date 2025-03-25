@@ -64,13 +64,13 @@ TinyGsmClient client(modem);
 //-------------------------------------------------------------------
 // SmartBeaconing Parameters (for APRS)
 //-------------------------------------------------------------------
-const unsigned long FAST_RATE = 60000;     // 60-second minimum interval
-const unsigned long SLOW_RATE = 300000;    // 300-second maximum interval
-const float FAST_SPEED = 90.0;            // km/h above which rate caps
-const float SLOW_SPEED = 5.0;             // km/h below which rate increases
-const float MIN_TURN_ANGLE = 28.0;        // Base turn threshold (°)
-const float TURN_SLOPE = 26.0;           // Dynamic angle adjustment (angle*speed)
-const float MIN_TURN_TIME = 30.0;         // Minimum time between turn beacons (sec)
+const unsigned long FAST_RATE = 30000;     // 30-second minimum interval
+const unsigned long SLOW_RATE = 180000;    // 180-second maximum interval
+const float FAST_SPEED = 70.0;             // km/h above which rate caps
+const float SLOW_SPEED = 3.0;              // km/h below which rate increases
+const float MIN_TURN_ANGLE = 20.0;         // Base turn threshold (°)
+const float TURN_SLOPE = 20.0;             // Dynamic angle adjustment (angle*speed)
+const float MIN_TURN_TIME = 15.0;          // Minimum time between turn beacons (sec)
 
 unsigned long lastTransmitTime = 0;
 unsigned long lastTurnTime = 0;
@@ -207,17 +207,18 @@ unsigned long getDynamicInterval(float speed) {
     return FAST_RATE;
   }
   
-  // Linear interpolation between SLOW_RATE and FAST_RATE
-  float speedRange = FAST_SPEED - SLOW_SPEED;
-  float rateRange = SLOW_RATE - FAST_RATE;
-  float normalizedSpeed = (speed - SLOW_SPEED) / speedRange;
-  return SLOW_RATE - (unsigned long)(normalizedSpeed * rateRange);
+  // Exponential decay for more frequent updates at mid-range speeds
+  float speedFactor = (speed - SLOW_SPEED) / (FAST_SPEED - SLOW_SPEED);
+  float intervalFactor = exp(-3 * speedFactor);  // Exponential decay
+  return FAST_RATE + (unsigned long)((SLOW_RATE - FAST_RATE) * intervalFactor);
 }
 
 //-------------------------------------------------------------------
 // Function: processBeaconConditions()
 // Returns true if beacon should be sent based on SmartBeaconing rules
 //-------------------------------------------------------------------
+const float MIN_DISTANCE = 0.1;  // Minimum distance to trigger a beacon (km)
+
 bool processBeaconConditions(float lat, float lon, float speed, float course) {
   unsigned long currentTime = millis();
   float courseChange = fabs(course - lastCourse);
@@ -229,15 +230,18 @@ bool processBeaconConditions(float lat, float lon, float speed, float course) {
     courseChange = 360 - courseChange;
   }
   
+  float distance = haversine(lastLat, lastLon, lat, lon);
+  
   bool timeTrigger = (currentTime - lastTransmitTime >= dynamicInterval);
   bool turnTrigger = (courseChange >= effectiveTurnThreshold) && 
                      (currentTime - lastTurnTime >= (unsigned long)(MIN_TURN_TIME * 1000));
+  bool distanceTrigger = (distance >= MIN_DISTANCE);
   
   if (turnTrigger) {
     lastTurnTime = currentTime;  // Reset turn timer
   }
   
-  return timeTrigger || turnTrigger;
+  return timeTrigger || turnTrigger || distanceTrigger;
 }
 
 //-------------------------------------------------------------------
@@ -296,22 +300,16 @@ void sendAPRSPacket(float lat, float lon, float speed, float alt, float course, 
            (abs(lon) - (int)abs(lon)) * 60,
            (lon >= 0) ? 'E' : 'W',
            (int)course,
-           (int)(speed * 1.852),   // Convert speed if needed
-           (int)(alt * 3.28084));   // Convert altitude from meters to feet
+           (int)(speed * 1.852),
+           (int)(alt * 3.28084));
 
-  // Determine battery status string
   float battVoltage = getBatteryVoltage();
-  char batteryStatus[16];  // Buffer for battery status string
+  char batteryStatus[16];
   if (battVoltage < 0.01) {
     snprintf(batteryStatus, sizeof(batteryStatus), "PLUGGED IN");
   } else {
     snprintf(batteryStatus, sizeof(batteryStatus), "%.2fV", battVoltage);
   }
-
-  char statusPacket[150];
-  snprintf(statusPacket, sizeof(statusPacket),
-           "%s>APRS,TCPIP*:>Sats: GPS=%d GLONASS=%d BeiDou=%d Batt=%s",
-           aprsCallsign, gps_sats, glonass_sats, beidou_sats, batteryStatus);
 
   SerialMon.print("Connecting to ");
   SerialMon.print(aprsServer);
@@ -332,12 +330,23 @@ void sendAPRSPacket(float lat, float lon, float speed, float alt, float course, 
   SerialMon.print("APRS position packet sent: ");
   SerialMon.println(positionPacket);
 
-  client.println(statusPacket);
-  SerialMon.print("APRS status packet sent: ");
-  SerialMon.println(statusPacket);
+  // Only send status packet if there are satellites
+  if (totalSats > 0) {
+    char statusPacket[150];
+    snprintf(statusPacket, sizeof(statusPacket),
+             "%s>APRS,TCPIP*:>Sats: GPS=%d GLONASS=%d BeiDou=%d Batt=%s",
+             aprsCallsign, gps_sats, glonass_sats, beidou_sats, batteryStatus);
+
+    client.println(statusPacket);
+    SerialMon.print("APRS status packet sent: ");
+    SerialMon.println(statusPacket);
+  } else {
+    SerialMon.println("No satellites, skipping status packet");
+  }
 
   client.stop();
 }
+
 
 //-------------------------------------------------------------------
 // Function: blinkLED()
@@ -571,5 +580,7 @@ void loop() {
       SerialMon.println(" V");
     }
   }
+  
+  // Add a small delay to prevent tight looping
   delay(1000);
 }
