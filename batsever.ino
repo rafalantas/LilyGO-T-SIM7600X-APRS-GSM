@@ -1,39 +1,34 @@
-//-------------------------------------------------------------------
-// Modem & Debug Configuration
-//-------------------------------------------------------------------
 #define TINY_GSM_MODEM_SIM7600
-
-#define UART_BAUD           115200
-
-#define MODEM_TX            27
-#define MODEM_RX            26
-#define MODEM_PWRKEY        4
-#define MODEM_DTR           32
-#define MODEM_RI            33
-#define MODEM_FLIGHT        25
-#define MODEM_STATUS        34
-
-#define LED_PIN             12
+#define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
+#define SerialAT Serial1
+#define SerialMon Serial
 
 // See all AT commands, if wanted
- #define DUMP_AT_COMMANDS
-
-#define SerialMon Serial
-#define SerialAT Serial1
-
-#define APRS_CALLSIGN "SQ4LOL"
-#define APRS_SSID 19
-#define APRS_PASSCODE "23475"
-#define APRS_SYMBOL "/f"  // Van symbol
+//#define DUMP_AT_COMMANDS
 
 #include <TinyGsmClient.h>
-#include <esp_adc_cal.h>
 #include <esp_sleep.h>
+#include <driver/rtc_io.h>
 
-const char apn[] = "internet";
-const char* aprsServer = "euro.aprs2.net";
-const int aprsPort = 14580;
+#define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds
+#define TIME_TO_SLEEP  600         // Time ESP32 will go to sleep (in seconds)
 
+#define UART_BAUD 115200
+
+#define MODEM_TX 27
+#define MODEM_RX 26
+#define MODEM_PWRKEY 4
+#define MODEM_DTR 32
+#define MODEM_RI 33
+#define MODEM_FLIGHT 25
+#define MODEM_STATUS 34
+
+#define SD_MISO 2
+#define SD_MOSI 15
+#define SD_SCLK 14
+#define SD_CS 13
+
+#define LED_PIN 12
 #ifdef DUMP_AT_COMMANDS
 #include <StreamDebugger.h>
 StreamDebugger debugger(SerialAT, SerialMon);
@@ -43,182 +38,61 @@ TinyGsm modem(SerialAT);
 #endif
 TinyGsmClient client(modem);
 
+const char apn[] = "internet";
+const char* aprsServer = "euro.aprs2.net";
+const int aprsPort = 14580;
+
+#define APRS_CALLSIGN "SQ4LOL"
+#define APRS_SSID 19
+#define APRS_PASSCODE "23475"
+#define APRS_SYMBOL "/f"
+
 bool gps_fix = false;
 unsigned long last_blink = 0;
 const int blink_interval = 500; // 0.5 second blink interval
 
 // SmartBeacon variables
-RTC_DATA_ATTR unsigned long lastTransmitTime = 0;
-RTC_DATA_ATTR float lastLat = 0, lastLon = 0;
-RTC_DATA_ATTR float lastSpeed = 0, lastCourse = 0;
-const unsigned long MIN_TRANSMIT_INTERVAL = 10000;  // 10 seconds in milliseconds
-const unsigned long MAX_TRANSMIT_INTERVAL = 300000; // 5 minutes in milliseconds
-const float TURN_THRESHOLD = 30.0; // degrees
-const float SPEED_THRESHOLD = 5.0; // km/h
+float lastLat = 0, lastLon = 0;
+float lastSpeed = 0, lastCourse = 0;
+unsigned long lastTransmitTime = 0;
+const float SB_LOW_SPEED = 5.0;     // km/h
+const float SB_HIGH_SPEED = 70.0;   // km/h
+const unsigned long SB_SLOW_RATE = 300000;  // 5 minutes in milliseconds
+const unsigned long SB_FAST_RATE = 60000;   // 1 minute in milliseconds
+const float SB_TURN_MIN_ANGLE = 30.0;       // degrees
+const float SB_TURN_SLOPE = 255.0;          // deg*mph
+const unsigned long SB_TURN_TIME = 15000;   // 15 seconds in milliseconds
 
-#define uS_TO_S_FACTOR 1000000ULL
-#define TIME_TO_SLEEP 60  // 1 hour in seconds
+// Store last position variables for position comparison
+//RTC_DATA_ATTR float last_lat = 0;
+//RTC_DATA_ATTR float last_lon = 0;
+//RTC_DATA_ATTR float last_speed = 0;
+//RTC_DATA_ATTR float last_course = 0;
 
-void setup() {
-  SerialMon.begin(115200);
-  SerialAT.begin(UART_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
 
-  SerialMon.println("Initializing modem...");
+// Function to send AT commands and wait for response
+bool sendATCommand(String command, String expected_response, unsigned long timeout) {
+  SerialAT.println(command);
+  unsigned long start_time = millis();
+  String response = "";
   
-  pinMode(MODEM_PWRKEY, OUTPUT);
-  pinMode(MODEM_FLIGHT, OUTPUT);
-  pinMode(LED_PIN, OUTPUT);
-
-  // Check if this is a wake from deep sleep
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
-    // Cold start
-    initModem();
-  } else {
-    // Wake from deep sleep
-    wakeModem();
-  }
-
-  // Common initialization
-  SerialMon.println("Modem is responsive");
-
-  // Connect to network
-  SerialMon.println("Connecting to network...");
-  if (!modem.gprsConnect(apn, "", "")) {
-    SerialMon.println("Failed to connect to network");
-  } else {
-    SerialMon.println("Connected to network");
-  }
-  // Enable GPS
-  sendATCommand("AT+CGNSSPWR=1", "OK", 1000);
-  sendATCommand("AT+CGNSSMODE=1", "OK", 1000);
-
-  SerialMon.println("GPS enabled and configured");
-}
-
-void loop() {
-  SerialMon.println("Requesting GPS info...");
-  
-  SerialAT.println("AT+CGNSSINFO");
-  
-  unsigned long startTime = millis();
-  while (millis() - startTime < 5000) {
+  while (millis() - start_time < timeout) {
     if (SerialAT.available()) {
-      String response = SerialAT.readStringUntil('\n');
-      SerialMon.println("Raw GPS data: " + response);
-      
-      if (response.startsWith("+CGNSSINFO:")) {
-        float lat, lon, alt, speed, course;
-        int gpsSats, glonassSats, beidouSats;
-        if (parseGNSSInfo(response, lat, lon, alt, speed, course, gpsSats, glonassSats, beidouSats)) {
-          gps_fix = true;
-          
-          if (shouldTransmit(lat, lon, speed, course)) {
-            // Send position packet
-            String aprsPacket = generateAPRSPacket(lat, lon, alt, speed, course);
-            if (sendAPRSPacket(aprsPacket)) {
-              SerialMon.println("APRS position packet sent successfully");
-              blinkLEDFast(3);
-              updateLastPosition(lat, lon, speed, course);
-              
-              // Send status packet
-              String statusPacket = generateAPRSStatusPacket(gpsSats, glonassSats, beidouSats);
-              if (sendAPRSPacket(statusPacket)) {
-                SerialMon.println("APRS status packet sent successfully");
-                blinkLEDFast(2);
-              } else {
-                SerialMon.println("Failed to send APRS status packet");
-              }
-            } else {
-              SerialMon.println("Failed to send APRS position packet");
-            }
-          }
-        } else {
-          gps_fix = false;
-        }
-        break;
+      response += SerialAT.readString();
+      if (response.indexOf(expected_response) >= 0) {
+        return true;
       }
     }
   }
-  
-  updateLED();
-  
-  // Check if we're running on battery
-  bool onBattery = readBatteryVoltage() > 0.1;
-  
-  if (onBattery) {
-    prepareForSleep();
-    esp_deep_sleep_start();
-  }
-
-  delay(1000); // Check GPS every second if not going to sleep
+  return false;
 }
 
-void initModem() {
-  digitalWrite(MODEM_PWRKEY, HIGH);
-  delay(300);
-  digitalWrite(MODEM_PWRKEY, LOW);
-
-  // Disable flight mode
-  digitalWrite(MODEM_FLIGHT, HIGH);
-}
-
-void wakeModem() {
-  gpio_hold_dis((gpio_num_t)MODEM_DTR);
-  pinMode(MODEM_DTR, OUTPUT);
-  digitalWrite(MODEM_DTR, LOW);
-  delay(2000);
-  modem.sleepEnable(false);
-}
-
-void prepareForSleep() {
-  SerialMon.println("Preparing for deep sleep...");
-  
-  modem.gprsDisconnect();
-  sendATCommand("AT+CGNSSPWR=0", "OK", 1000);
-  
-  // Put modem to sleep
-  pinMode(MODEM_DTR, OUTPUT);
-  digitalWrite(MODEM_DTR, HIGH);
-  gpio_hold_en((gpio_num_t)MODEM_DTR);
-  gpio_deep_sleep_hold_en();
-  modem.sleepEnable(true);
-  
-  // Configure wakeup timer
-  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
-  delay(200);
-  digitalWrite(LED_PIN, LOW);
-  SerialMon.flush();
-}
-
-bool shouldTransmit(float lat, float lon, float speed, float course) {
-  unsigned long currentTime = millis();
-  float distance = haversine(lastLat, lastLon, lat, lon);
-  float timeDiff = (currentTime - lastTransmitTime) / 1000.0; // in seconds
-  float courseDiff = abs(course - lastCourse);
-  
-  // Adjust course difference for 0/360 degree crossover
-  if (courseDiff > 180) {
-    courseDiff = 360 - courseDiff;
-  }
-
-  // Transmit if:
-  // 1. It's been more than MAX_TRANSMIT_INTERVAL since last transmission
-  // 2. Speed is above threshold and it's been more than MIN_TRANSMIT_INTERVAL
-  // 3. Course has changed significantly and it's been more than MIN_TRANSMIT_INTERVAL
-  // 4. Moved more than 1 km since last transmission
-  return (currentTime - lastTransmitTime >= MAX_TRANSMIT_INTERVAL) ||
-         (speed > SPEED_THRESHOLD && currentTime - lastTransmitTime >= MIN_TRANSMIT_INTERVAL) ||
-         (courseDiff > TURN_THRESHOLD && currentTime - lastTransmitTime >= MIN_TRANSMIT_INTERVAL) ||
-         (distance > 1.0);
-}
-
-void updateLastPosition(float lat, float lon, float speed, float course) {
-  lastTransmitTime = millis();
-  lastLat = lat;
-  lastLon = lon;
-  lastSpeed = speed;
-  lastCourse = course;
+// Function to read battery voltage
+float readBatteryVoltage() {
+  int vref = 1100;
+  int rawValue = analogRead(35);
+  float voltage = ((float)rawValue / 4095.0) * 2.0 * 3.3 * (vref / 1000.0); // Assuming a voltage divider
+  return voltage;
 }
 
 float haversine(float lat1, float lon1, float lat2, float lon2) {
@@ -232,13 +106,110 @@ float haversine(float lat1, float lon1, float lat2, float lon2) {
   return R * c;
 }
 
-float readBatteryVoltage() {
-  int vref = 1100;
-  int rawValue = analogRead(35);
-  float voltage = ((float)rawValue / 4095.0) * 2.0 * 3.3 * (vref / 1000.0); // Assuming a voltage divider
-  return voltage;
+// Function to prepare for deep sleep
+void prepareForDeepSleep() {
+  SerialMon.println("Preparing for deep sleep...");
+  
+  // Turn off LED
+  digitalWrite(LED_PIN, LOW);
+  
+  SerialMon.println("Enter modem sleep mode!");
+
+  // Pull up DTR to put the modem into sleep
+  pinMode(MODEM_DTR, OUTPUT);
+  digitalWrite(MODEM_DTR, HIGH);
+  
+  // Set DTR to keep at high level, if not set, DTR will be invalid after ESP32 goes to sleep
+  gpio_hold_en((gpio_num_t)MODEM_DTR);
+  gpio_deep_sleep_hold_en();
+
+  if (modem.sleepEnable(true) != true) {
+    SerialMon.println("Modem sleep failed!");
+  } else {
+    SerialMon.println("Modem entered sleep mode!");
+  }
+
+  // Wait to verify modem is sleeping
+  delay(2000);
+  SerialMon.println("Check modem response...");
+  if (!modem.testAT()) {
+    SerialMon.println("Modem is not responding, modem has entered sleep mode");
+  }
+
+  SerialMon.println("ESP32 going to deep sleep for " + String(TIME_TO_SLEEP) + " seconds");
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  delay(200);
+  esp_deep_sleep_start();
 }
 
+void setup() {
+  SerialMon.begin(115200);
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(100);
+  
+  // Set up LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+  
+  // Check if waking from deep sleep
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+    SerialMon.println("Cold boot, initializing modem...");
+    
+    // Initialize modem
+    pinMode(MODEM_PWRKEY, OUTPUT);
+    digitalWrite(MODEM_PWRKEY, LOW);
+    delay(100);
+    digitalWrite(MODEM_PWRKEY, HIGH);
+    delay(100);
+    digitalWrite(MODEM_PWRKEY, LOW);
+    
+    // Enable flight mode control
+    pinMode(MODEM_FLIGHT, OUTPUT);
+    digitalWrite(MODEM_FLIGHT, HIGH);
+  } else {
+    SerialMon.println("Waking up from deep sleep!");
+    
+    // Need to cancel GPIO hold if wake from sleep
+    gpio_hold_dis((gpio_num_t)MODEM_DTR);
+    
+    // Pull down DTR to wake up modem
+    pinMode(MODEM_DTR, OUTPUT);
+    digitalWrite(MODEM_DTR, LOW);
+    delay(2000);
+    modem.sleepEnable(false);
+  }
+  
+  // Wait for modem to respond
+  SerialMon.println("Checking if modem is online...");
+  int attempts = 0;
+  while (!modem.testAT() && attempts < 10) {
+    SerialMon.print(".");
+    delay(1000);
+    attempts++;
+  }
+  
+  if (attempts >= 10) {
+    SerialMon.println("Failed to connect to modem, restarting...");
+    ESP.restart();
+  }
+  
+  SerialMon.println("Modem is online!");
+  
+  // Initialize GPS
+  sendATCommand("AT+CGNSSPWR=1", "OK", 1000);
+  sendATCommand("AT+CGNSSMODE=1", "OK", 1000);
+  SerialMon.println("GPS enabled and configured");
+  
+  // Connect to network (add your APN details)
+  SerialMon.println("Connecting to network...");
+  if (!modem.gprsConnect(apn, "", "")) {
+    SerialMon.println("Failed to connect to network");
+  } else {
+    SerialMon.println("Connected to network");
+  }
+}
+
+// Parse GNSS info from AT command response
 bool parseGNSSInfo(String info, float &lat, float &lon, float &alt, float &speed, float &course, int &gpsSats, int &glonassSats, int &beidouSats) {
   // Remove "+CGNSSINFO: " prefix and trim
   info = info.substring(11);
@@ -290,6 +261,50 @@ bool parseGNSSInfo(String info, float &lat, float &lon, float &alt, float &speed
   return (parts[0] == "2" || parts[0] == "3");
 }
 
+// Check if we should transmit based on distance/time
+bool shouldTransmit(float lat, float lon, float speed, float course) {
+  unsigned long currentTime = millis();
+  float distance = haversine(lastLat, lastLon, lat, lon);
+  unsigned long timeSinceLastTx = currentTime - lastTransmitTime;
+  float courseDiff = abs(course - lastCourse);
+  
+  // Adjust course difference for 0/360 degree crossover
+  if (courseDiff > 180) {
+    courseDiff = 360 - courseDiff;
+  }
+
+  // Calculate the beacon rate based on speed
+  unsigned long beaconRate;
+  if (speed < SB_LOW_SPEED) {
+    beaconRate = SB_SLOW_RATE;
+  } else if (speed > SB_HIGH_SPEED) {
+    beaconRate = SB_FAST_RATE;
+  } else {
+    // Linear interpolation between slow and fast rates
+    float speedRatio = (speed - SB_LOW_SPEED) / (SB_HIGH_SPEED - SB_LOW_SPEED);
+    beaconRate = SB_SLOW_RATE - speedRatio * (SB_SLOW_RATE - SB_FAST_RATE);
+  }
+
+  // Check if it's time for a beacon based on speed
+  bool timeForSpeedBeacon = timeSinceLastTx >= beaconRate;
+
+  // Calculate turn threshold
+  float turnThreshold = SB_TURN_MIN_ANGLE;
+  if (speed > 0) {
+    turnThreshold += SB_TURN_SLOPE / speed;
+  }
+
+  // Check if it's time for a beacon based on course change
+  bool timeForTurnBeacon = (courseDiff > turnThreshold) && (timeSinceLastTx >= SB_TURN_TIME);
+
+  // Transmit if:
+  // 1. It's time for a speed-based beacon
+  // 2. There's been a significant course change and minimum turn time has elapsed
+  // 3. Moved more than 1 km since last transmission
+  return timeForSpeedBeacon || timeForTurnBeacon || (distance > 0.5);
+}
+
+// Generate APRS packet
 String generateAPRSPacket(float lat, float lon, float alt, float speed, float course) {
   char packet[150];  // Increased buffer size to accommodate the comment
   char latStr[9], lonStr[10];
@@ -314,6 +329,7 @@ String generateAPRSPacket(float lat, float lon, float alt, float speed, float co
   return String(packet);
 }
 
+// Generate APRS status packet
 String generateAPRSStatusPacket(int gpsSats, int glonassSats, int beidouSats) {
   char statusPacket[100];
   float batteryVoltage = readBatteryVoltage();
@@ -324,6 +340,7 @@ String generateAPRSStatusPacket(int gpsSats, int glonassSats, int beidouSats) {
   return String(statusPacket);
 }
 
+// Send APRS packet
 bool sendAPRSPacket(String packet) {
   if (client.connect(aprsServer, aprsPort)) {
     SerialMon.println("Connected to APRS-IS server");
@@ -342,6 +359,27 @@ bool sendAPRSPacket(String packet) {
   }
 }
 
+// Update last position
+void updateLastPosition(float lat, float lon, float speed, float course) {
+  lastTransmitTime = millis();
+  lastLat = lat;
+  lastLon = lon;
+  lastSpeed = speed;
+  lastCourse = course;
+}
+
+// Blink LED fast
+void blinkLEDFast(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+  digitalWrite(LED_PIN, HIGH);
+}
+
+// Update LED based on GPS fix
 void updateLED() {
   if (gps_fix) {
     // Steady LED when GPS has a fix
@@ -356,33 +394,69 @@ void updateLED() {
   }
 }
 
-void blinkLEDFast(int times) {
-  bool lastLEDState = digitalRead(LED_PIN);
-  for (int i = 0; i < times * 2; i++) {
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-    delay(100);
-  }
-  digitalWrite(LED_PIN, lastLEDState);
-}
-
-bool sendATCommand(const char* command, const char* expected_answer, unsigned int timeout) {
-  SerialAT.println(command);
-  if (expected_answer == NULL) return true;
-  unsigned long timer_start = millis();
-  bool answer_detected = false;
-  String response = "";
+void loop() {
+  SerialMon.println("Requesting GPS info...");
+  SerialAT.println("AT+CGNSSINFO");
   
-  while ((millis() - timer_start) < timeout) {
+  unsigned long startTime = millis();
+  bool packetSent = false;
+//  bool gps_fix = false;
+  
+  while (millis() - startTime < 5000) {
     if (SerialAT.available()) {
-      char c = SerialAT.read();
-      response += c;
-      if (response.indexOf(expected_answer) != -1) {
-        answer_detected = true;
+      String response = SerialAT.readStringUntil('\n');
+      SerialMon.println("Raw GPS data: " + response);
+      
+      if (response.startsWith("+CGNSSINFO:")) {
+        float lat, lon, alt, speed, course;
+        int gpsSats, glonassSats, beidouSats;
+        
+        if (parseGNSSInfo(response, lat, lon, alt, speed, course, gpsSats, glonassSats, beidouSats)) {
+          gps_fix = true;
+          
+          if (shouldTransmit(lat, lon, speed, course)) {
+            // Send position packet
+            String aprsPacket = generateAPRSPacket(lat, lon, alt, speed, course);
+            if (sendAPRSPacket(aprsPacket)) {
+              SerialMon.println("APRS position packet sent successfully");
+              blinkLEDFast(3);
+              updateLastPosition(lat, lon, speed, course);
+              packetSent = true;
+              
+              // Send status packet
+              String statusPacket = generateAPRSStatusPacket(gpsSats, glonassSats, beidouSats);
+              if (sendAPRSPacket(statusPacket)) {
+                SerialMon.println("APRS status packet sent successfully");
+                blinkLEDFast(2);
+              } else {
+                SerialMon.println("Failed to send APRS status packet");
+              }
+            } else {
+              SerialMon.println("Failed to send APRS position packet");
+            }
+          }
+        } else {
+          gps_fix = false;
+        }
         break;
       }
     }
   }
   
-  SerialMon.println(response);
-  return answer_detected;
+  updateLED();
+  
+  // Check battery voltage for deep sleep decision
+  float batteryVoltage = readBatteryVoltage();
+  
+  // If we're on battery power and packet was sent, go to deep sleep
+  if (batteryVoltage != 0.00 && packetSent) {
+    SerialMon.println("On battery power (" + String(batteryVoltage, 2) + "V), going to deep sleep");
+    prepareForDeepSleep();
+  } else if (batteryVoltage != 0.00) {
+    SerialMon.println("On battery power (" + String(batteryVoltage, 2) + "V), waiting for packet transmission");
+  } else {
+    SerialMon.println("Device is plugged in, continuing normal operation");
+  }
+  
+  delay(1000); // Check GPS every second
 }
