@@ -146,27 +146,6 @@ void loop() {
       }
     }
   }
-float batteryVoltage = readBatteryVoltage();
-
-if (batteryVoltage != 0.00) {
-  SerialMon.println("Going to deep sleep now");
-  SerialMon.flush(); 
-  
-  // Turn off the modem
-  digitalWrite(MODEM_PWRKEY, HIGH);
-  delay(1500);
-  digitalWrite(MODEM_PWRKEY, LOW);
-  
-  // Enable flight mode
-  digitalWrite(MODEM_FLIGHT, LOW);
-  
-  // Go to deep sleep
-  esp_deep_sleep_start();
-} else {
-  SerialMon.println("Device is plugged in, not going to sleep");
-  //delay(1000);  // Wait for a second before checking again
-}
-  
   updateLED();
   delay(1000); // Check GPS every second
 }
