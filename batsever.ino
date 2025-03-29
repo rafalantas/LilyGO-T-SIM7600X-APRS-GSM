@@ -50,6 +50,7 @@ const int aprsPort = 14580;
 bool gps_fix = false;
 unsigned long last_blink = 0;
 const int blink_interval = 500; // 0.5 second blink interval
+int signalPercentage = -1;  // Stores GSM signal strength percentage
 
 // SmartBeacon variables
 float lastLat = 0, lastLon = 0;
@@ -104,6 +105,45 @@ float haversine(float lat1, float lon1, float lat2, float lon2) {
             sin(dLon/2) * sin(dLon/2);
   float c = 2 * atan2(sqrt(a), sqrt(1-a));
   return R * c;
+}
+// Function to check signal strength
+void checkSignalStrength() {
+    SerialMon.println("Checking signal strength...");
+    SerialAT.println("AT+CSQ"); // Send AT+CSQ command
+
+    unsigned long startTime = millis();
+    String response = "";
+
+    // Wait for a response from the modem
+    while (millis() - startTime < 2000) { // 2-second timeout
+        if (SerialAT.available()) {
+            response += SerialAT.readStringUntil('\n');
+            if (response.indexOf("+CSQ:") >= 0) {
+                break; // Exit loop once we find "+CSQ:"
+            }
+        }
+    }
+
+    // Parse response
+    int rssi = -1; // Default value if parsing fails
+    if (response.indexOf("+CSQ:") >= 0) {
+        int startIdx = response.indexOf("+CSQ:") + 6;
+        int endIdx = response.indexOf(",", startIdx);
+        String rssiStr = response.substring(startIdx, endIdx);
+        rssi = rssiStr.toInt(); // Convert RSSI string to integer
+    }
+
+    // Calculate percentage and update global variable
+    if (rssi >= 0 && rssi <= 31) {
+        signalPercentage = map(rssi, 0, 31, 0, 100); // Map RSSI value to percentage (0-100%)
+        SerialMon.println("Signal Strength: " + String(signalPercentage) + "%");
+    } else if (rssi == 99) {
+        signalPercentage = -1; // Not detectable
+        SerialMon.println("Signal Strength: Not detectable (No network available)");
+    } else {
+        signalPercentage = -1; // Failed to read signal strength
+        SerialMon.println("Failed to read signal strength.");
+    }
 }
 
 // Function to prepare for deep sleep
@@ -331,12 +371,19 @@ String generateAPRSPacket(float lat, float lon, float alt, float speed, float co
 
 // Generate APRS status packet
 String generateAPRSStatusPacket(int gpsSats, int glonassSats, int beidouSats) {
-  char statusPacket[100];
+  char statusPacket[150];
   float batteryVoltage = readBatteryVoltage();
+  // Update signal strength before generating the packet
+    checkSignalStrength(); // Call the function to update signalPercentage
   String batteryStatus = (batteryVoltage == 0.00) ? "Plugged in" : String(batteryVoltage, 2) + "V";
   
-  snprintf(statusPacket, sizeof(statusPacket), "%s-%d>APRS,TCPIP*:>Sats: GPS=%d GLONASS=%d BeiDou=%d Batt: %s",
-           APRS_CALLSIGN, APRS_SSID, gpsSats, glonassSats, beidouSats, batteryStatus.c_str());
+  // Format signal strength as a string
+    String signalStatus = (signalPercentage >= 0) ? String(signalPercentage) + "%" : "Not detectable";
+
+// Create the APRS status packet
+    snprintf(statusPacket, sizeof(statusPacket),
+             "%s-%d>APRS,TCPIP*:>Sats: GPS=%d GLONASS=%d BeiDou=%d Batt: %s Signal: %s",
+             APRS_CALLSIGN, APRS_SSID, gpsSats, glonassSats, beidouSats, batteryStatus.c_str(), signalStatus.c_str());
   return String(statusPacket);
 }
 
@@ -444,7 +491,6 @@ void loop() {
   }
   
   updateLED();
-  
   // Check battery voltage for deep sleep decision
   float batteryVoltage = readBatteryVoltage();
   
