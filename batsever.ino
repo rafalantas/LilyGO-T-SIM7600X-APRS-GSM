@@ -11,7 +11,7 @@
 #include <driver/rtc_io.h>
 
 #define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds
-#define TIME_TO_SLEEP  600         // Time ESP32 will go to sleep (in seconds)
+#define TIME_TO_SLEEP  300         // Time ESP32 will go to sleep (in seconds)
 
 #define UART_BAUD 115200
 
@@ -43,7 +43,7 @@ const char* aprsServer = "euro.aprs2.net";
 const int aprsPort = 14580;
 
 #define APRS_CALLSIGN "SQ4LOL"
-#define APRS_SSID 19
+#define APRS_SSID 9
 #define APRS_PASSCODE "23475"
 #define APRS_SYMBOL "/f"
 
@@ -362,7 +362,7 @@ String generateAPRSPacket(float lat, float lon, float alt, float speed, float co
   char lonHemi = (lon >= 0) ? 'E' : 'W';
   
   // Generate APRS packet with comment
-  snprintf(packet, sizeof(packet), "%s-%d>APRS,TCPIP*:!%s%c%c%s%c%c%03.0f/%03.0f/A=%06.0fRafal in Mazda CX5 QTH:Hajnowka",
+  snprintf(packet, sizeof(packet), "%s-%d>APRS,TCPIP*:!%s%c%c%s%c%c%03.0f/%03.0f/A=%06.0fRafal in Mazda QTH: Hajnowka",
            APRS_CALLSIGN, APRS_SSID, latStr, latHemi, APRS_SYMBOL[0], lonStr, lonHemi, APRS_SYMBOL[1],
            course, speed / 1.852, alt * 3.28084); // Convert speed back to knots, altitude to feet
   
