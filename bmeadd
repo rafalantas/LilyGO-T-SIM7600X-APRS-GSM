@@ -12,6 +12,9 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
+#include <ctime>
+#include <string>
+
 
 #define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds
 #define TIME_TO_SLEEP  300         // Time ESP32 will go to sleep (in seconds)
@@ -263,7 +266,7 @@ void setup() {
 }
 
 // Parse GNSS info from AT command response
-bool parseGNSSInfo(String info, float &lat, float &lon, float &alt, float &speed, float &course, int &gpsSats, int &glonassSats, int &beidouSats) {
+bool parseGNSSInfo(String info, float &lat, float &lon, float &alt, float &speed, float &course, int &gpsSats, int &glonassSats, int &beidouSats, String &mdhm) {
   // Remove "+CGNSSINFO: " prefix and trim
   info = info.substring(11);
   info.trim();
@@ -310,6 +313,26 @@ bool parseGNSSInfo(String info, float &lat, float &lon, float &alt, float &speed
   glonassSats = parts[2].toInt();
   beidouSats = parts[3].toInt();
 
+  // Extract date and time
+   String dateStr = parts[8]; // Format: DDMMYY
+    String timeStr = parts[9]; // Format: HHMMSS.0
+
+    // Remove decimal part from timeStr
+    String timeIntPart = timeStr.substring(0, timeStr.indexOf('.'));
+
+    if (dateStr.length() == 6 && timeIntPart.length() == 6) {
+        String month = dateStr.substring(2, 4); // MM
+        String day = dateStr.substring(0, 2);   // DD
+        String hour = timeIntPart.substring(0, 2); // HH
+        String minute = timeIntPart.substring(2, 4); // MM
+
+        mdhm = month + day + hour + minute; // Combine into MDHM format
+        SerialMon.println("MDHM date generated: " + mdhm);
+  }
+   else {
+    SerialMon.println("Invalid date/time format in GNSS response");
+    
+  }
   // Return true if we have a valid fix (2D or 3D)
   return (parts[0] == "2" || parts[0] == "3");
 }
@@ -399,51 +422,38 @@ String generateAPRSStatusPacket(int gpsSats, int glonassSats, int beidouSats) {
              APRS_CALLSIGN, APRS_SSID, gpsSats, glonassSats, beidouSats, batteryStatus.c_str(), signalStatus.c_str());
   return String(statusPacket);
 }
+// Create the APRS weather packet
+String createWeatherPacket(String mdhm) {
+    // Read sensor data
+    float temperatureC = bme.readTemperature(); // Celsius
+    float humidity = bme.readHumidity();        // Percentage
+    float pressure = bme.readPressure() / 100.0F; // hPa
 
-String createWeatherPacket(float lat, float lon) {
-  // Read temperature, humidity, and pressure from BME280
-  float temperature = bme.readTemperature();  // Temperature in °C
-  float humidity = bme.readHumidity();        // Relative humidity in %
-  float pressure = bme.readPressure() / 100.0F; // Pressure in hPa
+    // Convert temperature to Fahrenheit
+    int tempF = round(temperatureC * 1.8 + 32);
 
-  // Convert temperature to Fahrenheit (APRS uses Fahrenheit)
-  int tempF = round(temperature * 1.8 + 32);
+    // Format humidity as two digits (APRS uses "00" for 100%)
+    int humAPRS = (humidity >= 100) ? 0 : round(humidity);
 
-  // Convert latitude and longitude to APRS format
-  char latStr[9], lonStr[10];
-  int latDeg = abs((int)lat);
-  float latMin = abs(lat - latDeg) * 60;
-  int lonDeg = abs((int)lon);
-  float lonMin = abs(lon - lonDeg) * 60;
+    // Convert pressure to tenths of millibars for APRS
+    int pressureAPRS = round(pressure * 10);
 
-  snprintf(latStr, sizeof(latStr), "%02d%05.2f", latDeg, latMin);
-  snprintf(lonStr, sizeof(lonStr), "%03d%05.2f", lonDeg, lonMin);
+    // Placeholder values for wind speed, rain, and other fields
+    int windSpeed = 0; // Wind speed (knots, placeholder)
 
-  char latHemi = (lat >= 0) ? 'N' : 'S';
-  char lonHemi = (lon >= 0) ? 'E' : 'W';
+    // Create the APRS weather packet using MDHM format for timestamp
+    char weatherPacket[200];
+    
+    snprintf(weatherPacket, sizeof(weatherPacket),
+             "%s-%d>APRS,TCPIP*:_%sc...s...g...t%03dh%02db%05d",
+             APRS_CALLSIGN, APRS_SSID,
+             mdhm.c_str(),
+             tempF,
+             humAPRS,
+             pressureAPRS);
 
-  // Format humidity as two digits (APRS uses "00" for 100%)
-  int humAPRS = (humidity >= 100) ? 0 : round(humidity);
-
-  // Convert pressure to inches of mercury (inHg) for APRS
-  float pressureInHg = pressure * 0.02953; // hPa to inHg
-  int pressureAPRS = round(pressureInHg * 100); // Multiply by 100 for APRS format
-
-  // Generate the weather packet with placeholders for unsupported fields
-  char weatherPacket[150];
-  snprintf(weatherPacket, sizeof(weatherPacket),
-           "%s-%d>APRS,TCPIP*:_%s%c/%s%c_%03dg000t%03dh%02db%05d",
-           APRS_CALLSIGN, APRS_SSID,
-           latStr, latHemi, lonStr, lonHemi,
-           0, // Wind direction placeholder (000 if unknown)
-           tempF,
-           humAPRS,
-           pressureAPRS);
-
-  return String(weatherPacket); // Return the generated packet
+    return String(weatherPacket);
 }
-
-
 
 // Send APRS packet
 bool sendAPRSPacket(String packet) {
@@ -515,8 +525,9 @@ void loop() {
       if (response.startsWith("+CGNSSINFO:")) {
         float lat, lon, alt, speed, course;
         int gpsSats, glonassSats, beidouSats;
+        String mdhm;
         
-        if (parseGNSSInfo(response, lat, lon, alt, speed, course, gpsSats, glonassSats, beidouSats)) {
+        if (parseGNSSInfo(response, lat, lon, alt, speed, course, gpsSats, glonassSats, beidouSats, mdhm)) {
           gps_fix = true;
           
           if (shouldTransmit(lat, lon, speed, course)) {
@@ -528,7 +539,7 @@ void loop() {
               updateLastPosition(lat, lon, speed, course);
               packetSent = true;
               // Send temp packet
-            String weatherPacket = createWeatherPacket(lat, lon); // Generate the packet
+            String weatherPacket = createWeatherPacket(mdhm); // Generate the packet
                 // Send the weather packet using your existing sendAPRSPacket function
                 if (sendAPRSPacket(weatherPacket)) {
                   SerialMon.println("Weather packet sent successfully: " + weatherPacket);
@@ -559,7 +570,8 @@ void loop() {
   // Read temperature and humidity from the BME280 sensor
   float temperature = bme.readTemperature(); // Temperature in Celsius
   float humidity = bme.readHumidity();       // Relative Humidity in %
-  
+  float pressure = bme.readPressure();
+
   // Print temperature and humidity to Serial Monitor
   Serial.print("Temperature: ");
   Serial.print(temperature);
@@ -568,6 +580,10 @@ void loop() {
   Serial.print("Humidity: ");
   Serial.print(humidity);
   Serial.println(" %");
+
+    Serial.print("Pressure: ");
+  Serial.print(pressure);
+  Serial.println(" socs");
 
   updateLED();
   // Check battery voltage for deep sleep decision
