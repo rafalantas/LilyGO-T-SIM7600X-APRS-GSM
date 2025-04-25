@@ -16,7 +16,7 @@
 #define LED_PIN             12
 
 // See all AT commands, if wanted
- #define DUMP_AT_COMMANDS
+// #define DUMP_AT_COMMANDS
 
 #define SerialMon Serial
 #define SerialAT Serial1
@@ -85,11 +85,22 @@ void setup() {
 
   SerialMon.println("Modem is responsive");
 
-  // Connect to network
+  // Retry logic for network connection
+  int retry_count = 0;
+  const int max_retries = 5;
+  const int retry_delay = 2000; // 2 seconds
+
   SerialMon.println("Connecting to network...");
-  if (!modem.gprsConnect(apn, "", "")) {
-    SerialMon.println("Failed to connect to network");
-  } else {
+  while (!modem.gprsConnect(apn, "", "")) {
+    SerialMon.println("Failed to connect to network, retrying...");
+    delay(retry_delay);
+    retry_count++;
+    if (retry_count >= max_retries) {
+      SerialMon.println("Max retries reached, failed to connect to network");
+      break;
+    }
+  }
+  if (retry_count < max_retries) {
     SerialMon.println("Connected to network");
   }
   // Enable GPS
