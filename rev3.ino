@@ -22,7 +22,7 @@
 #define SerialAT Serial1
 
 #define APRS_CALLSIGN "SQ4LOL"
-#define APRS_SSID 19
+#define APRS_SSID 9
 #define APRS_PASSCODE "23475"
 #define APRS_SYMBOL "/f"  // Van symbol
 
